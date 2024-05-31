@@ -1,129 +1,72 @@
-import os
-import json
-import logging
-import uuid
-import time
-import boto3
+# import boto3
+import pytz,time,uuid,json,os,logging
 
-from logging.config import dictConfig
-from api.core.models.logs import LogConfig
-from fastapi import HTTPException, Request, Response
+from requests import Session
+from fastapi import Request, Response
 from fastapi.routing import APIRoute
 from typing import Callable
 from user_agents import parse
 from urllib.parse import parse_qs
-from datetime import datetime, timedelta
+from datetime import datetime
 
-LOGS_TABLE = os.environ['LOGS']
-dynamodb = boto3.resource('dynamodb')
-table = dynamodb.Table(LOGS_TABLE)
+LOGS_TABLE = os.getenv('LOGS_TABLE')
+user = os.getenv('ES_USER')
+passwd = os.getenv('ES_PASSWD')
+base_url = os.getenv('ES_URL')
 
-
-
-dictConfig(LogConfig().dict())
 logger = logging.getLogger("app")
 logger.setLevel(logging.INFO)
 
-#OPTION 1 with logger
-class CustomRoute(APIRoute):
-    def get_route_handler(self) -> Callable:
-        original_route_handler = super().get_route_handler()
-
-        async def custom_route_handler(request: Request) -> Response:
-            try:
-                body = await request.json()
-            except:
-                body = await request.body()
-
-            logger.info({
-                'uuid': f'{uuid.uuid4()}',
-                'start_request': f'path={request.url.path}',
-                'body': f'{body}'
-            })
-
-            response: Response = await original_route_handler(request)
-
-            return response
-
-        return custom_route_handler
-      
-
-#OPTION 2 for databases
 class LoggingRoute(APIRoute):
     def get_route_handler(self) -> Callable:
         original_route_handler = super().get_route_handler()
 
         async def custom_route_handler(request: Request) -> Response:
+            request_body = {}
             try:
                 uuid_str = str(uuid.uuid4())
                 header = dict(request.headers)
                 if "uuid" in header.keys():
                     uuid_str = header["uuid"]
 
-                user_agent = parse(request.headers["user-agent"])
-                
-                browser=user_agent.browser.version
-                if len(browser) >=2:
-                    browser_major,browser_minor = browser[0],browser[1]
-                else:
-                    browser_major,browser_minor =0,0
-
-                
-                user_os=user_agent.os.version
-                if len(user_os) >=2:
-                    os_major,os_minor = user_os[0],user_os[1]
-                else:
-                    os_major,os_minor =0,0
-
                 # Request json
                 body = await request.body()
-                if len(body)!=0:
-                    body=json.loads(body)
+                if len(body) != 0:
+                    try:
+                        body = json.loads(body)
+                    except:
+                        body = body
+                        logger.warn(f'Not JSON body: {body}')
                 else:
-                    body=""
-
+                    body = {}
+                request_body = body
+                
+                tz = pytz.timezone('America/Sao_Paulo')
+                date_now = datetime.now(tz).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                
+                user = _get_user(request)
+                
                 request_json = {
-                    "type":"request",
-                    "uuid":uuid_str,
+                    "type": "request",
+                    "uuid": uuid_str,
                     "env": os.environ.get("ENV"),
                     "region": os.environ.get("REGION"),
                     "name": os.environ.get("NAME"),
                     "method": request.method,
-                    "useragent":
-                    {
-                        "family": user_agent.browser.family,
-                        "major":  browser_major,
-                        "minor":  browser_minor,
-                        "patch":  user_agent.browser.version_string,
-                            
-                        "device": {
-                                "family": user_agent.device.family,
-                                "brand": user_agent.device.brand,
-                                "model": user_agent.device.model,
-                                "major": "0",
-                                "minor": "0",
-                                "patch": "0"
-                            },
-                        "os": {
-                                "family": user_agent.os.family,
-                                "major": os_major,
-                                "minor": os_minor,
-                                "patch": user_agent.os.version_string 
-                            },
-                    
-                    },
-                    "url": request.url.path,
+                    "url": request.url,
                     "query": parse_qs(str(request.query_params)),
-                    "body":body,
+                    "body": body,
                     "length": request.get("content-length"),
-                    'date': f'{datetime.now():%Y-%m-%d %H:%M:%S%z}'   
-
+                    'date': date_now
                 }
-                
+
                 start_time = time.time()
                 response = await original_route_handler(request)
                 process_time = (time.time() - start_time) * 1000
-                formatted_process_time = '{0:.2f}'.format(process_time)
+                formatted_process_time = float('{0:.2f}'.format(process_time))
+
+                tz = pytz.timezone('America/Sao_Paulo')
+                date_now = datetime.now(tz).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
                 # Response json
                 metrics_json = {
@@ -131,55 +74,79 @@ class LoggingRoute(APIRoute):
                     "uuid": uuid_str,
                     "env": os.environ.get("ENV"),
                     "region": os.environ.get("REGION"),
-                    "name": os.environ.get("NAME"),              
+                    "name": os.environ.get("NAME"),
                     "method": request.method,
                     "status_code": response.status_code,
-                    "url": request.url.path,
+                    "url": request.url,
                     "query": parse_qs(str(request.query_params)),
                     "length": response.headers["content-length"],
                     "latency": formatted_process_time,
-                    "date": f'{datetime.now():%Y-%m-%d %H:%M:%S%z}'   
+                    "date": date_now,
+                    "body": json.loads(response.__dict__['body'].decode())
 
                 }
-                
-                ttl_date = datetime.now() + timedelta(90)
-                
-                try: 
-                    item = {
-                    'url' : f'{str(request_json["url"])}',
-                    'method' : f'{request_json["method"]}',
-                    'status_code' : f'{metrics_json["status_code"]}',
-                    'latency': f'{metrics_json["latency"]}',
-                    'date': f'{metrics_json["date"]}',
-                    'ts_epoch': int(ttl_date.timestamp()),
-                    'body': f'{str(request_json["body"])}',
-                    'id': f'{request_json["uuid"]}',
-                    'query': f'{metrics_json["query"]}'
-                    }
-                    table.put_item(Item=item)
-                except Exception as exc:
-                    print(exc)
-                    pass
 
-            except Exception as exc:
-
-                body = await request.body()
-                response = await original_route_handler(request)
-                
-                ttl_date = datetime.now() + timedelta(90)
                 item = {
-                'url' : f'{str(request.url.path)}',
-                'method' : f'{request.method}',
-                'status_code' : f'{response.status_code}',
-                'date': f'{datetime.now():%Y-%m-%d %H:%M:%S%z}',
-                'ts_epoch': int(ttl_date.timestamp()),
-                'body': '',
-                'id': f'{str(uuid.uuid4())}',
-                "query": parse_qs(str(request.query_params))
+                    'url': f'{str(request_json["url"])}',
+                    'method': f'{request_json["method"]}',
+                    'status_code': f'{metrics_json["status_code"]}',
+                    'latency': metrics_json["latency"],
+                    'date': f'{metrics_json["date"]}',
+                    'request': {"body":request_json["body"]},
+                    'response': {"body":metrics_json['body']},
+                    'id': f'{request_json["uuid"]}',
+                    'query': f'{metrics_json["query"]}',
+                    'request_ip': request.client.host,
+                    'email':user
+                } 
+            except Exception as e:
+                tz = pytz.timezone('America/Sao_Paulo')
+                date_now = datetime.now(tz).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                user = _get_user(request)
+                                
+                item = {
+                    'url': f'{str(request.url)}',
+                    'method': f'{request.method}',
+                    'status_code': 500,
+                    'latency': 0,
+                    'date': date_now,
+                    'request': {"body":request_body}, 
+                    'response': {"body":{"Exception":f"APP EXCEPTIONS: {e}"}}, 
+                    'id': f'{str(uuid.uuid4())}',
+                    "query": f'{parse_qs(str(request.query_params))}',
+                    'request_ip': request.client.host,
+                    'email':user
                 }
-                table.put_item(Item=item)
 
-
+            _put_item(item,item["id"])
+            logger.warn(item)
+            response = await original_route_handler(request)
+            
             return response
 
         return custom_route_handler
+    
+
+def _put_item(item:dict,document_id):
+    if not base_url:
+        print('None ES_URL variable defined')
+    else:
+        url = f"{base_url}/{LOGS_TABLE}/_doc/{document_id}"
+        auth = (user, passwd)
+        session = Session()
+        session.auth = auth
+        
+        response = session.put(url, json=item)
+        if response.status_code == 201:
+            print("Document created successfully!")
+        else:
+            print(f"Error creating document: {response.text}")
+
+def _get_user(request):
+    if request.headers.get("Authorization"):
+        cred = request.headers.get("Authorization").replace('Bearer ','')
+        auth_credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=cred)
+        user = get_email(auth_credentials)
+    else:
+        user = 'NoneToken'
+    return user
